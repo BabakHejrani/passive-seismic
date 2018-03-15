@@ -1,10 +1,10 @@
 #!/bin/env python
 """
 Description:
-    Example template python script structure.
-    .......
-    .......
-   
+    Implements migration algorithm as described in Frassetto et al. (2010):
+      Improved imaging with phase-weighted common conversion point stacks
+      of receiver functions (GJI)
+
 References:
  
 CreationDate:   3/15/18
@@ -173,7 +173,7 @@ class Migrate:
         self._chunk_index = self._comm.Get_rank()
 
         self._ppDict = defaultdict(list) # dictionary for piercing point results
-        self._proc_zs = defaultdict(list) # depth values that each process works on
+        self._proc_izs = defaultdict(list) # depth indices that each process works on
         self._treeDict = {} # dictionary for Kd-trees for each depth layer
         self._d2tIO = None
 
@@ -208,33 +208,32 @@ class Migrate:
             count = 0
             for iproc in np.arange(self._nproc):
                 for iz in np.arange(np.divide(self._geometry._gzaac.shape[0], self._nproc)):
-                    z = self._geometry._gzaac[count]
-                    self._proc_zs[iproc].append(z)
+                    self._proc_izs[iproc].append(count)
                     count += 1
             # end for
 
             for iproc in np.arange(np.mod(self._geometry._gzaac.shape[0], self._nproc)):
-                z = self._geometry._gzaac[count]
-                self._proc_zs[iproc].append(z)
+                self._proc_izs[iproc].append(count)
                 count += 1
         # end if
 
         # broadcast workload to all procs
-        self._proc_zs = self._comm.bcast(self._proc_zs, root=0)
+        self._proc_izs = self._comm.bcast(self._proc_izs, root=0)
         if (self._chunk_index == 0): log.info(' Distributing workload over %d processors..' % (self._nproc))
 
         if(self._debug):
             print 'proc: %d, %d depth values\n========='%(self._chunk_index,
-                                                   len(self._proc_zs[self._chunk_index]))
-            for z in self._proc_zs[self._chunk_index]: print z
+                                                   len(self._proc_izs[self._chunk_index]))
+            for iz in self._proc_izs[self._chunk_index]: print iz
         # end if
     # end func
 
     def __generatePiercingPoints(self):
-        for z in self._proc_zs[self._chunk_index]:
+        for iz in self._proc_izs[self._chunk_index]:
+            z = self._geometry._gzaac[iz]
             ppoints = self._stream.ppoints(z)
-            self._ppDict[z] = ppoints
-            #print z, len(ppoints)
+            self._ppDict[iz] = ppoints
+            #print iz, z, len(ppoints)
         # end for
 
         # Gather all results on proc 0
@@ -277,30 +276,51 @@ class Migrate:
         times = self._stream[0].times() - 25
         for ix in range(self._geometry._nx - 1):
             for iy in range(self._geometry._ny - 1):
-                for z in self._proc_zs[self._chunk_index]:
-                    t = treeDict[z]
+                for iz in self._proc_izs[self._chunk_index]:
+                    z = self._geometry._gzaac[iz]
+                    t = self._treeDict[iz]
 
-                    ids = t.query_ball_point([gxc[ix, iy, iz],
-                                              gyc[ix, iy, iz],
-                                              gzc[ix, iy, iz]], r=20, n_jobs=6)
+                    ids = t.query_ball_point([self._geometry._gxsc[ix, iy, iz],
+                                              self._geometry._gysc[ix, iy, iz],
+                                              self._geometry._gzsc[ix, iy, iz]], r=20)
                     if (len(ids) == 0):
-                        numEmpty += 1
+                        empty[ix,iy,iz] = 1
                         continue
                     # end if
 
-                    ct = d2tIO(z)
+                    ct = self._d2tIO(z)
                     for i in ids:
                         tidx = np.argmin(np.fabs(times - ct))
                         # print tidx*(1./stream[i].stats.sampling_rate)-25, d2tIO(z)
-                        vol[ix, iy, iz] += stream[i].data[tidx]
+                        vol[ix, iy, iz] += self._stream[i].data[tidx]
                         volHits[ix, iy, iz] += 1.
-                        # end for
-                        # end for
+                    # end for
+                # end for
             # end for
-            print
-            ix
+            print ix
         # end for
 
+        # Sum all on master proc
+        if(self._chunk_index==0):
+            totalVol = np.zeros(self._geometry._gxsc.shape)
+            totalVolHits = np.zeros(self._geometry._gxsc.shape)
+            totalEmpty = np.zeros(self._geometry._gxsc.shape)
+        else:
+            totalVol = None
+            totalVolHits = None
+            totalEmpty = None
+        # end if
+        self._comm.Reduce([vol, MPI.DOUBLE], [totalVol, MPI.DOUBLE],
+                          op=MPI.SUM, root=0)
+        self._comm.Reduce([volHits, MPI.DOUBLE], [totalVolHits, MPI.DOUBLE],
+                          op=MPI.SUM, root=0)
+        self._comm.Reduce([empty, MPI.DOUBLE], [totalEmpty, MPI.DOUBLE],
+                          op=MPI.SUM, root=0)
+
+        if(self._chunk_index==0):
+            np.savetxt('/tmp/vol.txt', vol.flatten())
+            np.savetxt('/tmp/volHits.txt', volHits.flatten())
+            np.savetxt('/tmp/empty.txt', empty.flatten())
     # end func
 # end class
 
