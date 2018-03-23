@@ -29,6 +29,7 @@ from rf.util import _add_processing_info, direct_geodetic
 
 from scipy.spatial import cKDTree
 from scipy.interpolate import interp1d
+from scipy.signal import hilbert
 from mpi4py import MPI
 import logging
 log = logging.getLogger('migration')
@@ -156,13 +157,13 @@ class Geometry:
 # end class
 
 class Migrate:
-    def __init__(self, geometry, stream, velocity_model='iasp91.dat', debug=False):
+    def __init__(self, geometry, stream, velocity_model='ak135.dat', debug=False):
         assert isinstance(geometry, Geometry), 'Must be an instance of class Geometry..'
         self._geometry = geometry
 
         assert isinstance(stream, RFStream), 'Must be an instance of class RFStream..'
         self._stream = stream
-        if(velocity_model != 'iasp91.dat'): assert 0, 'Only iasp91.dat is currently supported'
+        if(velocity_model != 'ak135.dat'): assert 0, 'Only ak135.dat is currently supported'
         self._velocity_model = velocity_model
 
         self._debug = debug
@@ -176,13 +177,18 @@ class Migrate:
         self._proc_izs = defaultdict(list) # depth indices that each process works on
         self._treeDict = {} # dictionary for Kd-trees for each depth layer
         self._d2tIO = None
+        self._iphaseTraceDataList = []
 
         # Create depth-to-time interpolation object
         rp = 'rf'
-        rpf = '/'.join(('data', 'iasp91.dat')) # find where iasp91.dat is located
-        fp = pkg_resources.resource_stream(rp, rpf)
-        fn = fp.name
-        fp.close()
+        rpf = '/'.join(('data', 'ak135.dat')) # find where ak135.dat is located
+        #fp = pkg_resources.resource_stream(rp, rpf)
+        #fn = fp.name
+        #fp.close()
+        
+        #fn = '/home/rakib/.local/lib/python2.7/site-packages/rf/data/ak135.dat'
+        fn = '/home/raq/.local/lib/python2.7/site-packages/rf/data/iasp91.dat'
+        
 
         m = np.loadtxt(fn)
         dlim = m[:, 0] < 2800 # don't need data past 2800 km
@@ -197,6 +203,16 @@ class Migrate:
 
         # split workload
         self.__split_work()
+
+        # compute instantaneous phase
+        for t in self._stream:
+            analytic = hilbert(t.data)
+            angle = np.angle(analytic)
+            iPhase = np.exp(1j * angle)
+            self._iphaseTraceDataList.append(iPhase)
+        #end for
+
+        log.info('Computed instantaneous phases.')
     # end func
 
     def __split_work(self):
@@ -224,7 +240,7 @@ class Migrate:
         if(self._debug):
             print 'proc: %d, %d depth values\n========='%(self._chunk_index,
                                                    len(self._proc_izs[self._chunk_index]))
-            for iz in self._proc_izs[self._chunk_index]: print iz
+            for iz in self._proc_izs[self._chunk_index]: print iz, self._geometry._gzaac[iz]
         # end if
     # end func
 
@@ -244,24 +260,51 @@ class Migrate:
             for ip in np.arange(self._nproc):
                 for k in ppDictList[ip].keys():
                     self._ppDict[k] = ppDictList[ip][k]
+
+                    #print len(ppDictList[ip][k])
                 # end for
             # end for
-            #print(len(self._ppDict))
 
-            # Create Kd-trees for each depth value
+            if(self._debug):
+                f = open('/tmp/pp_parallel.txt', 'w+')
+                for k in sorted(self._ppDict.keys()):
+                    f.write('%f\n'%(self._geometry._gzaac[k]))
+                    pp = self._ppDict[k]
+                    for i in pp:
+                        f.write('%f %f\n'%(i[0], i[1]))
+                f.close()
+            #end if
+
+            # Create xyz nodes for each depth value
             for k in self._ppDict.keys():
                 ts = (90 - self._ppDict[k][:, 0]) / 180. * np.pi
                 ps = self._ppDict[k][:, 1] / 180. * np.pi
-                rs = (self._geometry._earth_radius - k) * np.ones(ts.shape)
+
+                z = self._geometry._gzaac[k]
+                rs = (self._geometry._earth_radius - z) * np.ones(ts.shape)
                 rtps = np.array([rs, ts, ps]).T
 
                 xyzs = rtp2xyz(rtps[:, 0], rtps[:, 1], rtps[:, 2])
-                self._treeDict[k] = cKDTree(xyzs)
+                self._treeDict[k] = xyzs
             # end for
         # end if
 
-        # broadcast Kd-tree dictionary to all procs
+        if(self._chunk_index==0): log.info(' Broadcasting Kd-tree nodes..')
+        # broadcast xyz nodes to all procs
         self._treeDict = self._comm.bcast(self._treeDict, root=0)
+        
+        # Create Kd-trees for each depth value
+        for k in sorted(self._treeDict.keys()):
+            self._treeDict[k] = cKDTree(self._treeDict[k])
+        
+        if(self._debug):
+            f = open('/tmp/kd_parallel.%02d.txt'%(self._chunk_index), 'w+')
+            for k in sorted(self._treeDict.keys()):
+                f.write('%f\n'%(self._geometry._gzaac[k]))
+                for i in self._treeDict[k].data:
+                    f.write('%f %f %f\n' % (i[0], i[1], i[2]))
+            f.close()
+        # end if
     # end func
 
     def execute(self):
@@ -271,8 +314,9 @@ class Migrate:
         if (self._chunk_index == 0): log.info(' Stacking amplitudes..')
 
         vol = np.zeros(self._geometry._gxsc.shape)
+        cz = np.zeros(self._geometry._gxsc.shape, dtype=np.complex_)
         volHits = np.zeros(self._geometry._gxsc.shape)
-        empty = np.zeros(self._geometry._gxsc.shape)
+        
         times = self._stream[0].times() - 25
         for ix in range(self._geometry._nx - 1):
             for iy in range(self._geometry._ny - 1):
@@ -283,44 +327,58 @@ class Migrate:
                     ids = t.query_ball_point([self._geometry._gxsc[ix, iy, iz],
                                               self._geometry._gysc[ix, iy, iz],
                                               self._geometry._gzsc[ix, iy, iz]], r=20)
+
                     if (len(ids) == 0):
-                        empty[ix,iy,iz] = 1
                         continue
                     # end if
 
                     ct = self._d2tIO(z)
-                    for i in ids:
-                        tidx = np.argmin(np.fabs(times - ct))
-                        # print tidx*(1./stream[i].stats.sampling_rate)-25, d2tIO(z)
-                        vol[ix, iy, iz] += self._stream[i].data[tidx]
+                    tidx = np.argmin(np.fabs(times - ct))
+                    for i, si in enumerate(ids):
+                        # print tidx*(1./stream[si].stats.sampling_rate)-25, d2tIO(z)
+
+                        vol[ix, iy, iz] += self._stream[si].data[tidx]
+                        cz[ix, iy, iz] += self._iphaseTraceDataList[si][tidx]
+
                         volHits[ix, iy, iz] += 1.
                     # end for
+
+                    if(volHits[ix, iy, iz]>0):
+                        cz[ix, iy, iz] /= volHits[ix, iy, iz]
+                    
+                    cz[ix, iy, iz] = np.abs(cz[ix, iy, iz])
                 # end for
             # end for
-            print ix
+            #print ix
         # end for
+        
+        cz = cz.astype(np.float64)
 
         # Sum all on master proc
         if(self._chunk_index==0):
+            totalCz = np.zeros(self._geometry._gxsc.shape)
             totalVol = np.zeros(self._geometry._gxsc.shape)
             totalVolHits = np.zeros(self._geometry._gxsc.shape)
-            totalEmpty = np.zeros(self._geometry._gxsc.shape)
         else:
+            totalCz = None
             totalVol = None
             totalVolHits = None
-            totalEmpty = None
         # end if
+
+        self._comm.Reduce([cz, MPI.DOUBLE], [totalCz, MPI.DOUBLE],
+                          op=MPI.SUM, root=0)
         self._comm.Reduce([vol, MPI.DOUBLE], [totalVol, MPI.DOUBLE],
                           op=MPI.SUM, root=0)
         self._comm.Reduce([volHits, MPI.DOUBLE], [totalVolHits, MPI.DOUBLE],
                           op=MPI.SUM, root=0)
-        self._comm.Reduce([empty, MPI.DOUBLE], [totalEmpty, MPI.DOUBLE],
-                          op=MPI.SUM, root=0)
 
         if(self._chunk_index==0):
-            np.savetxt('/tmp/vol.txt', vol.flatten())
-            np.savetxt('/tmp/volHits.txt', volHits.flatten())
-            np.savetxt('/tmp/empty.txt', empty.flatten())
+            np.savetxt('/tmp/cz.txt', totalCz.flatten())
+            np.savetxt('/tmp/vol.txt', totalVol.flatten())
+            np.savetxt('/tmp/volHits.txt', totalVolHits.flatten())
+            np.savetxt('/tmp/gxaa.txt', self._geometry._gxaa.flatten())
+            np.savetxt('/tmp/gyaa.txt', self._geometry._gyaa.flatten())
+            np.savetxt('/tmp/gzaa.txt', self._geometry._gzaa.flatten())
     # end func
 # end class
 
@@ -330,12 +388,16 @@ def main():
     :return:
     """
 
-    rffile = '/home/rakib/work/pst/rf/notebooks/7X-rf_profile_rfs-cleaned.h5'
+    #rffile = '/home/rakib/work/pst/rf/notebooks/rf_pt15_to5Hz.h5'
+    rffile = '/media/data/work/GA/rf/rf_pt15_to5Hz.h5'
     s = read_rf(rffile, 'H5')
 
     g = Geometry(start_lat_lon=(-18.75, 138.15), azimuth=80,
-                 lengthkm=450, nx=45, widthkm=350, ny=35, depthkm=100, nz=50)
-    m = Migrate(geometry=g, stream=s)
+                 lengthkm=450, nx=45, widthkm=350, ny=35, depthkm=100, nz=400, debug=False)
+    #g = Geometry(start_lat_lon=(-18.35, 138.45), azimuth=90,
+    #             lengthkm=450, nx=45, widthkm=350, ny=35, depthkm=100, nz=500, debug=False)
+
+    m = Migrate(geometry=g, stream=s, debug=False)
 
     m.execute()
 
