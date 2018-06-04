@@ -379,6 +379,8 @@ class Migrate:
             np.savetxt('/tmp/gxaa.txt', self._geometry._gxaa.flatten())
             np.savetxt('/tmp/gyaa.txt', self._geometry._gyaa.flatten())
             np.savetxt('/tmp/gzaa.txt', self._geometry._gzaa.flatten())
+            np.savetxt('/tmp/glon.txt', self._geometry._glon.flatten())
+            np.savetxt('/tmp/glat.txt', self._geometry._glat.flatten())
     # end func
 # end class
 
@@ -393,7 +395,7 @@ def main():
     s = read_rf(rffile, 'H5')
 
     g = Geometry(start_lat_lon=(-18.75, 138.15), azimuth=80,
-                 lengthkm=450, nx=45, widthkm=350, ny=35, depthkm=100, nz=400, debug=False)
+                 lengthkm=450, nx=45, widthkm=350, ny=35, depthkm=100, nz=500, debug=False)
     #g = Geometry(start_lat_lon=(-18.35, 138.45), azimuth=90,
     #             lengthkm=450, nx=45, widthkm=350, ny=35, depthkm=100, nz=500, debug=False)
 
